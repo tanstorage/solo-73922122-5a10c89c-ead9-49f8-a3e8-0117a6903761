@@ -16,13 +16,28 @@ services:
     ports:
       - "5432:5432"
 
-  app:
+  # 双实例：同一镜像、同一数据库，验证重叠人群并发查询不超支、
+  # 查询号跨实例幂等。两个实例都提供导出页与带噪查询页。
+  app1:
     build: ./app
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/clinical
       EXPORT_DIR: /data/exports
+      INSTANCE_NAME: app1
     ports:
-      - "8000:8000"
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app2:
+    build: ./app
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/clinical
+      EXPORT_DIR: /data/exports
+      INSTANCE_NAME: app2
+    ports:
+      - "8002:8000"
     depends_on:
       db:
         condition: service_healthy

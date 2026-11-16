@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>带噪声检验分布查询</title>
+<style>
+  :root { --ok:#15803d; --run:#1d4ed8; --fail:#b91c1c; --warn:#a16207; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f1f5f9; color: #0f172a; }
+  header { background: #0f172a; color: #fff; padding: 14px 24px;
+           display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header p { margin: 0; font-size: 12px; color: #94a3b8; }
+  header nav { margin-left: auto; font-size: 13px; }
+  header a { color: #7dd3fc; text-decoration: none; }
+  .inst { display: inline-block; padding: 1px 10px; border-radius: 999px;
+          background: #334155; color: #e2e8f0; font-size: 12px; }
+  main { max-width: 980px; margin: 20px auto; padding: 0 16px;
+         display: grid; gap: 16px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px;
+          padding: 16px 20px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; }
+  label { font-size: 13px; color: #334155; margin-right: 6px; }
+  select, input[type=text], input[type=number] { padding: 6px 8px;
+         border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; }
+  button { padding: 7px 14px; border: 0; border-radius: 6px; font-size: 13px;
+           cursor: pointer; background: #1d4ed8; color: #fff; }
+  button:disabled { background: #cbd5e1; cursor: not-allowed; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+           font-size: 12px; font-weight: 600; color: #fff; background: #64748b; }
+  .badge.completed { background: var(--ok); }
+  .badge.rejected { background: var(--fail); }
+  .badge.replayed { background: var(--warn); }
+  table.kv { border-collapse: collapse; font-size: 13px; }
+  table.kv td { padding: 3px 14px 3px 0; vertical-align: top; }
+  table.kv td:first-child { color: #64748b; white-space: nowrap; }
+  table.list { border-collapse: collapse; font-size: 12px; width: 100%; }
+  table.list th, table.list td { border-bottom: 1px solid #e2e8f0;
+         padding: 5px 8px; text-align: left; }
+  table.list th { color: #64748b; font-weight: 600; }
+  .buckets { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+  .bucket { flex: 1; min-width: 150px; background: #f8fafc;
+            border: 1px solid #e2e8f0; border-radius: 8px;
+            padding: 10px 14px; text-align: center; }
+  .bucket .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bucket .k { font-size: 12px; color: #64748b; margin-top: 2px; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; background: #0f172a;
+         color: #a5f3fc; border-radius: 8px; padding: 10px 14px; height: 140px;
+         overflow-y: auto; white-space: pre-wrap; }
+  .muted { color: #64748b; font-size: 12px; }
+  .err { color: var(--fail); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>带噪声检验分布查询</h1>
+  <p>Laplace 噪声 · 每患者 ε 预算上限 1.0（跨试验累计）· 查询号幂等</p>
+  <span class="inst" id="inst">实例：…</span>
+  <nav><a href="/index.html">导出页面 →</a></nav>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 提交查询</h2>
+    <div class="row">
+      <span><label>试验号</label><select id="trial"></select></span>
+      <span><label>全局查询号</label>
+        <input type="text" id="qid" placeholder="如 Q-2026-001" style="width:150px"></span>
+      <span><label>ε</label>
+        <select id="eps">
+          <option value="0.1">0.1</option>
+          <option value="0.2">0.2</option>
+          <option value="0.5" selected>0.5</option>
+        </select></span>
+      <span><label>模拟慢统计(秒)</label>
+        <input type="number" id="slow" value="0" min="0" max="30" style="width:60px"></span>
+      <button id="submitBtn">提交查询</button>
+    </div>
+    <p class="muted">按每名有检验患者的平均测值分桶（负数 / 0～100 含端点 / 超过 100），
+      各桶独立加入 Laplace(0, 1/ε) 噪声。本入口不返回患者明细或真实计数；
+      参与患者与统计取自同一已提交快照。任一参与者 ε 余额不足则整次拒绝（不指明患者）。</p>
+  </section>
+
+  <section class="card">
+    <h2>2. 查询结果</h2>
+    <div id="result"><span class="muted">尚未提交查询</span></div>
+  </section>
+
+  <section class="card">
+    <h2>3. 最近查询（全部实例共享）</h2>
+    <div id="recent"><span class="muted">—</span></div>
+    <p class="muted">同一查询号 + 相同参数重试会返回首个已存结果（不重复扣费、不重新加噪）；
+      同号异参数会被拒绝（409）。响应丢失后可按查询号从
+      <code>GET /api/queries/{查询号}</code> 恢复结果。</p>
+  </section>
+
+  <section class="card">
+    <h2>事件日志</h2>
+    <div id="log"></div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const log = m => {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent += `[${t}] ${m}\n`;
+  $("log").scrollTop = $("log").scrollHeight;
+};
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => null);
+  if (!r.ok) {
+    const detail = body && body.detail ? body.detail : r.statusText;
+    const err = new Error(`${r.status} ${detail}`);
+    err.status = r.status;
+    throw err;
+  }
+  return body;
+}
+
+async function loadTrials() {
+  const trials = await api("/api/trials");
+  $("trial").innerHTML = trials.map(t =>
+    `<option value="${t.trial_id}">${t.trial_id}（${t.patients} 名患者）</option>`).join("");
+}
+
+async function loadInstance() {
+  const i = await api("/api/instance");
+  $("inst").textContent = `实例：${i.name}`;
+}
+
+function fmt(x) { return x === null || x === undefined ? "—" : Number(x).toFixed(3); }
+
+function renderOutcome(o) {
+  const el = $("result");
+  const head = [
+    ["查询号", `<code>${o.query_id}</code>`],
+    ["试验号 / ε", `${o.trial_id} / ${o.epsilon}`],
+    ["状态", `<span class="badge ${o.status}">${o.status}</span>` +
+             (o.replayed ? '　<span class="badge replayed">已存结果回放（未重复扣费/加噪）</span>' : "")],
+  ];
+  let html = `<table class="kv">${head.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>`;
+  if (o.status === "completed" && o.buckets) {
+    html += `<div class="buckets">
+      <div class="bucket"><div class="v">${fmt(o.buckets.negative)}</div><div class="k">平均值 &lt; 0</div></div>
+      <div class="bucket"><div class="v">${fmt(o.buckets.zero_to_100)}</div><div class="k">0 ≤ 平均值 ≤ 100</div></div>
+      <div class="bucket"><div class="v">${fmt(o.buckets.over_100)}</div><div class="k">平均值 &gt; 100</div></div>
+    </div>`;
+  } else if (o.status === "rejected") {
+    html += `<p class="err">整次查询已拒绝：部分参与者隐私预算（ε 累计上限 1.0）不足。
+      不指明具体患者；本次未扣减任何预算。</p>`;
+  }
+  el.innerHTML = html;
+}
+
+$("submitBtn").onclick = async () => {
+  const qid = $("qid").value.trim();
+  if (!qid) { log("请填写全局查询号"); return; }
+  const body = {
+    query_id: qid,
+    trial_id: $("trial").value,
+    epsilon: parseFloat($("eps").value),
+    slow_seconds: parseFloat($("slow").value || "0"),
+  };
+  $("submitBtn").disabled = true;
+  const t0 = performance.now();
+  try {
+    const o = await api("/api/queries", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    renderOutcome(o);
+    const ms = (performance.now() - t0).toFixed(0);
+    log(`查询 ${o.query_id}（${o.trial_id}, ε=${o.epsilon}）→ ${o.status}` +
+        (o.replayed ? "（回放已存结果）" : "") + `，耗时 ${ms}ms`);
+  } catch (e) {
+    if (e.status === 409) log(`拒绝：查询号冲突（异参数）—— ${e.message}`);
+    else log(`失败：${e.message}`);
+  } finally {
+    $("submitBtn").disabled = false;
+    loadRecent();
+  }
+};
+
+async function loadRecent() {
+  try {
+    const rows = await api("/api/queries");
+    if (!rows.length) { $("recent").innerHTML = '<span class="muted">暂无查询</span>'; return; }
+    $("recent").innerHTML = `<table class="list">
+      <tr><th>查询号</th><th>试验</th><th>ε</th><th>状态</th>
+          <th>负数桶</th><th>0~100 桶</th><th>&gt;100 桶</th><th>时间</th></tr>
+      ${rows.map(r => `<tr>
+        <td><code>${r.query_id}</code></td><td>${r.trial_id}</td><td>${r.epsilon}</td>
+        <td><span class="badge ${r.status}">${r.status}</span></td>
+        <td>${r.buckets ? fmt(r.buckets.negative) : "—"}</td>
+        <td>${r.buckets ? fmt(r.buckets.zero_to_100) : "—"}</td>
+        <td>${r.buckets ? fmt(r.buckets.over_100) : "—"}</td>
+        <td>${new Date(r.created_at).toLocaleString()}</td>
+      </tr>`).join("")}
+    </table>`;
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+loadInstance();
+loadTrials().then(loadRecent);
+setInterval(loadRecent, 3000);
+</script>
+</body>
+</html>
