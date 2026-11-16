@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>临床试验数据离线导出</title>
+<style>
+  :root { --ok:#15803d; --run:#1d4ed8; --fail:#b91c1c; --cancel:#a16207; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f1f5f9; color: #0f172a; }
+  header { background: #0f172a; color: #fff; padding: 14px 24px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header p { margin: 4px 0 0; font-size: 12px; color: #94a3b8; }
+  main { max-width: 980px; margin: 20px auto; padding: 0 16px;
+         display: grid; gap: 16px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px;
+          padding: 16px 20px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; }
+  label { font-size: 13px; color: #334155; margin-right: 6px; }
+  select, input[type=number] { padding: 6px 8px; border: 1px solid #cbd5e1;
+         border-radius: 6px; font-size: 13px; }
+  button { padding: 7px 14px; border: 0; border-radius: 6px; font-size: 13px;
+           cursor: pointer; background: #1d4ed8; color: #fff; }
+  button.secondary { background: #475569; }
+  button.danger { background: #b91c1c; }
+  button:disabled { background: #cbd5e1; cursor: not-allowed; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+           font-size: 12px; font-weight: 600; color: #fff; background: #64748b; }
+  .badge.running { background: var(--run); }
+  .badge.ready { background: var(--ok); }
+  .badge.failed { background: var(--fail); }
+  .badge.cancelled { background: var(--cancel); }
+  table.kv { border-collapse: collapse; font-size: 13px; }
+  table.kv td { padding: 3px 14px 3px 0; vertical-align: top; }
+  table.kv td:first-child { color: #64748b; white-space: nowrap; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; background: #0f172a;
+         color: #a5f3fc; border-radius: 8px; padding: 10px 14px; height: 160px;
+         overflow-y: auto; white-space: pre-wrap; }
+  .muted { color: #64748b; font-size: 12px; }
+  a.dl { display: inline-block; padding: 8px 16px; background: var(--ok);
+         color: #fff; border-radius: 6px; text-decoration: none; font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>临床试验数据离线导出</h1>
+  <p>同一数据库快照 · 双连接并行读取 · 不锁源表 · 可即时取消</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 开始导出批次</h2>
+    <div class="row">
+      <span><label>试验号</label><select id="trial"></select></span>
+      <span><label>模拟慢查询(秒)</label>
+        <input type="number" id="slow" value="0" min="0" max="120" style="width:70px"></span>
+      <span><label><input type="checkbox" id="kill"> 故障注入：</label>
+        <input type="number" id="killAfter" value="3" min="1" max="120" style="width:60px">
+        <label>秒后断开检验读连接</label></span>
+      <button id="startBtn">开始导出（自动取消旧批次）</button>
+      <button id="cancelBtn" class="danger" disabled>取消当前批次</button>
+    </div>
+    <p class="muted">导出包含 patients.csv（患者号、试验号）与 labs.csv（检验号、患者号、数值）的 ZIP；
+      两份 CSV 均完整才提供下载。</p>
+  </section>
+
+  <section class="card">
+    <h2>2. 批次状态</h2>
+    <div id="batchStatus"><span class="muted">暂无批次</span></div>
+  </section>
+
+  <section class="card">
+    <h2>3. 源端写入模拟（跨表事务更正）</h2>
+    <div class="row">
+      <button id="mutStart" class="secondary">启动更正写入</button>
+      <button id="mutStop" class="secondary">停止</button>
+      <span id="mutStatus" class="muted">未运行</span>
+    </div>
+    <p class="muted">每 0.2 秒在<strong>单个事务</strong>内随机更正一名患者的试验归属及其全部检验值。
+      导出基于 MVCC 快照，不会阻塞这些写入，也不会读到导出开始后的更正。</p>
+  </section>
+
+  <section class="card">
+    <h2>4. 数据库连接（export-*/mutator）</h2>
+    <div id="conns" class="muted">—</div>
+  </section>
+
+  <section class="card">
+    <h2>事件日志</h2>
+    <div id="log"></div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const log = m => {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent += `[${t}] ${m}\n`;
+  $("log").scrollTop = $("log").scrollHeight;
+};
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+async function loadTrials() {
+  const trials = await api("/api/trials");
+  $("trial").innerHTML = trials.map(t =>
+    `<option value="${t.trial_id}">${t.trial_id}（${t.patients} 名患者）</option>`).join("");
+}
+
+let currentId = null;
+
+$("startBtn").onclick = async () => {
+  const body = {
+    trial_id: $("trial").value,
+    slow_seconds: parseFloat($("slow").value || "0"),
+    kill_reader_after: $("kill").checked ? parseFloat($("killAfter").value || "3") : null,
+  };
+  try {
+    const b = await api("/api/batches", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    currentId = b.id;
+    log(`批次 ${b.id.slice(0,8)} 已开始：试验 ${b.trial_id}` +
+        (b.slow_seconds ? `，慢查询 ${b.slow_seconds}s` : "") +
+        (b.kill_reader_after ? `，${b.kill_reader_after}s 后断开检验读连接` : ""));
+  } catch (e) { log(`开始失败：${e.message}`); }
+};
+
+$("cancelBtn").onclick = async () => {
+  if (!currentId) return;
+  const t0 = performance.now();
+  try {
+    const b = await api(`/api/batches/${currentId}/cancel`, {method: "POST"});
+    log(`批次 ${b.id.slice(0,8)} 取消已受理（HTTP 耗时 ${(performance.now()-t0).toFixed(0)}ms，状态=${b.status}）`);
+  } catch (e) { log(`取消失败：${e.message}`); }
+};
+
+$("mutStart").onclick = async () => { await api("/api/mutator/start", {method:"POST"}); log("源端更正写入已启动"); };
+$("mutStop").onclick  = async () => { await api("/api/mutator/stop",  {method:"POST"}); log("源端更正写入已停止"); };
+
+function renderBatch(b) {
+  const el = $("batchStatus");
+  if (!b || !b.id) { el.innerHTML = '<span class="muted">暂无批次</span>'; $("cancelBtn").disabled = true; return; }
+  currentId = b.id;
+  const rows = [
+    ["批次", `<code>${b.id.slice(0,8)}</code>　<span class="badge ${b.status}">${b.status}</span>`],
+    ["试验号", b.trial_id],
+    ["行数", `patients: ${b.patients_rows}　labs: ${b.labs_rows}`],
+    ["本批连接", `${b.connections_open} 个打开　后端 PID: ${b.backend_pids.join(", ") || "—"}`],
+  ];
+  if (b.error) rows.push(["错误", `<span style="color:var(--fail)">${b.error}</span>`]);
+  let html = `<table class="kv">${rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>`;
+  if (b.status === "ready" && b.download_url)
+    html += `<p><a class="dl" href="${b.download_url}">下载 ZIP</a></p>`;
+  el.innerHTML = html;
+  $("cancelBtn").disabled = b.status !== "running";
+}
+
+async function poll() {
+  try {
+    const b = await api("/api/batches/current");
+    renderBatch(b.id ? b : null);
+    const m = await api("/api/mutator");
+    $("mutStatus").textContent = m.running
+      ? `运行中，已提交 ${m.corrections} 笔跨表更正`
+      : `未运行（累计 ${m.corrections} 笔）`;
+    const cs = await api("/api/connections");
+    $("conns").innerHTML = cs.length
+      ? "<table class=kv>" + cs.map(c =>
+          `<tr><td>${c.application_name}</td><td>pid ${c.pid}</td>` +
+          `<td>${c.state || "—"}</td><td>${c.wait_event_type || ""}</td>` +
+          `<td>${c.xact_age || ""}</td></tr>`).join("") + "</table>"
+      : "无 export/mutator 连接";
+  } catch (e) { /* 忽略瞬时错误 */ }
+}
+
+loadTrials().then(poll);
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
